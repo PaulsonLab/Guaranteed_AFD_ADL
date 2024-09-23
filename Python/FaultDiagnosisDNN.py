@@ -10,15 +10,15 @@ from scipy.stats.qmc import Sobol
 from matlab import engine
 from matlab import double as mldb
 eng = engine.start_matlab()
+eng.cd(r'C:\\Users\\Nate\\Documents\\MATLAB\\FaultDiagnosis\\DoMPCCSTR', nargout=1)
+eng.addpath(eng.genpath(r'C:\\Users\\Nate\\Documents\\MATLAB\\CORA-master'), nargout=0)
+eng.addpath(eng.genpath(r'C:\\Users\\Nate\\Documents\\MATLAB\\FaultDiagnosis'), nargout=0)
+eng.addpath(eng.genpath(r'C:\\Users\\Nate\\Documents\\MATLAB\\YALMIP-master'), nargout=0)
 
-eng.cd(r'PATH to Matlab code', nargout=1)
-eng.addpath(eng.genpath(r'PATH to CORA'), nargout=0)
-eng.addpath(eng.genpath(r'PATH to general fault diagnosis folder'), nargout=0)
-eng.addpath(eng.genpath(r'PATH to Yalmip'), nargout=0)
 
 
 #Import data
-data = loadmat('PATH to initial dataset')
+data = loadmat('C:\\Users\\Nate\\Documents\\MATLAB\\FaultDiagnosis\\DoMPCCSTR\\10D512-1.mat')
 X = data['train_u'].T
 Y = data['y']
 
@@ -27,24 +27,26 @@ train_Y = torch.tensor(Y).float()
 #print('Data in, train_X size = ',train_X.size())
     
 
-#Function to find optimal separations inputs.
+
+
+#Loop training neural networks to find the optimal inputs
 def OptimalPointLoop(its,alp,dims):
     #Initialize Parameters
+    wmdir = 'C:/Users/Nate/Desktop/School/Paulson Lab/FaultDetection/model'
     incumbent = []
-    #CSTR problem needs 2 ranges labeled trange and crange defaulting to 100 and 1 respectively.
-    trange = mldb(100)
-    crange = mldb(1)
-    #Linear problem needs 1 range 20 for normal, 25 for state constrained.
-    urange = mldb(20)
+    crange = mldb(1) #For the linear problem
+    trange = mldb(100) #For the simple cstr
+    urange = mldb(25) #For the simple cstr
+    Frange = mldb(4.27) #For the complex cstr
+    Q_dotrange = mldb(8211) #For the complex cstr
 
-    #To not change the initial sets as we iterate.
     ltr_X = train_X
     ltr_Y = train_Y
     
     
-    #Loop through the active learning process.
+    #Loop through the active learning process
     for j in range(its):
-        #Find current incumbent
+        #Find incumbent
         opt_pt = [1000]
         d = 1e10
         for i in range(len(ltr_X)):
@@ -52,24 +54,20 @@ def OptimalPointLoop(its,alp,dims):
                 if d > dist(ltr_X[i]):
                     opt_pt = ltr_X[i]
                     d = dist(opt_pt)
-        incumbent.append(opt_pt)
         
-        #Set energy bound for proposed active learning method.
         maxE = d
         
-        #Train DNN on current data. (epochs, learning rate, batch size, depth-1, initial width, inputs to train on, outputs to train on, dimensions of input)
+        incumbent.append(opt_pt)
+        #Initial Train
         myDNN = train(1000,0.0008,200,2,20,ltr_X,ltr_Y,dims)
         
-        #Sobol dense sample inside energy bound region.
         ds = torch.tensor(Sobol(dims).random(131072)*maxE-maxE/2,dtype=torch.float)
-        #Predict sobol samples output.
         dstv = myDNN(ds)
-        #Turn predictions from logit to probability space.
         dstvprob = np.exp(dstv.detach().numpy())/(1+np.exp(dstv.detach().numpy()))
         
         
-        #Active Learning Batch.
-        #OMLT solve where criteria is the predicted probability of overlapping.
+        #Active Learning Batch
+        #OMLT solve
         bestpts = torch.zeros(alp,dims)
         sol = (OMLT(myDNN,dims,criteria=.7))
         bestpts[0,:] = torch.tensor(sol).view(1,dims)
@@ -80,8 +78,12 @@ def OptimalPointLoop(its,alp,dims):
         sol = (OMLT(myDNN,dims,criteria=.4))
         bestpts[3,:] = torch.tensor(sol).view(1,dims)
         
+        
+        
+        
 
-        #Create a subset of the dense sample and its predicted values such that all points have a lower energy than maxE.
+        
+        #Create a subset of the dense sampling and its predicted values such that all points have a lower energy than maxE
         ssds = None
         ssdstvprob = []
         for i in range(len(ds)):
@@ -93,11 +95,11 @@ def OptimalPointLoop(its,alp,dims):
                 ssdstvprob.append(dstvprob[i])
         
         ssdstvprob = np.array(ssdstvprob)
-
-        #Calcualte the Shannon Entropy for the points in the subset.
+        print(len(ssdstvprob))
+        #Calcualte the entropy for the points in the subset
         entropy = -ssdstvprob*np.log(ssdstvprob+1e-10)-(1-ssdstvprob)*np.log(1-ssdstvprob+1e-10)
         
-        #Find active learning points - 4 new points with the highest Shannon Entropy.
+        #Find the best points
         bestpti =  -1
         for i in range(alp-4):
             bestpti = np.argmax(entropy)
@@ -108,27 +110,29 @@ def OptimalPointLoop(its,alp,dims):
         
         #print(bestpts)
         
-        #Get the true value for actively learned points and append new points and value to training data for next iteration.
         gtv = 0
         for bestpt in bestpts:
-            #Make sure to change input arguments for the range if changing from CSTR problem to Linear problem example.
-            #Its called activeLearning for CSTR problem and GetTrueValue... for the linear problems.
-            gtv = eng.GetTrueValue(mldb(vector=bestpt.detach().tolist()),urange)
+            gtv = eng.activeLearning(mldb(vector=bestpt.detach().tolist()),Frange,Q_dotrange)
 
             ltr_X = torch.cat((ltr_X,bestpt.view(-1,dims)))
             ltr_Y = torch.cat((ltr_Y,torch.tensor(gtv).view(-1,1)))
         
-        #Print current iteration.
         print(j)
-        
-    #Return all found inputs and their resulting output as well as the best point in the set over each learning iteration.
     return ltr_X, ltr_Y, incumbent
 
 
-#Make sure to set dimensions correct.
-pts, ptstv, incumbent = OptimalPointLoop(30,16,8)
 
-#Find final optimal point.
+#Check for bottlenecks
+import cProfile
+import pstats
+profiler = cProfile.Profile()
+
+profiler.enable()
+
+pts, ptstv, incumbent = OptimalPointLoop(30,16,10)
+
+#Find optimal soln
+
 opt_pt = [1000]
 for i in range(len(pts)):
     if ptstv[i] == 0:
@@ -138,5 +142,40 @@ for i in range(len(pts)):
 print(opt_pt)
 print(dist(opt_pt))
 incumbent.append(opt_pt)
-np.savez('PATH to save data of the run',incumbent,pts,ptstv)
+np.savez('C:\\Users\\Nate\\Desktop\\School\\Paulson Lab\\FaultDetection\\Python\\do-mpc_CSTR\\soln-1',incumbent,pts,ptstv)
+
+print(opt_pt.tolist())
+
+
+# Stop profiling
+profiler.disable()
+
+# Print the profiling results
+stats = pstats.Stats(profiler)
+
+# Sort the functions by cumulative time
+stats.sort_stats('cumulative')
+
+# Print the top 10 functions
+print("Top 10 functions by runtime:")
+stats.print_stats(20)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
